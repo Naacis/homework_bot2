@@ -21,18 +21,14 @@ from mosdiary.exceptions import APIException
 
 load_dotenv()
 
-# ===== ОТКЛЮЧАЕМ ПРОВЕРКУ SSL (для локальных прокси) =====
 os.environ["SSL_CERT_FILE"] = ""
 os.environ["REQUESTS_CA_BUNDLE"] = ""
 os.environ["CURL_CA_BUNDLE"] = ""
 
 PROXY_URL = os.getenv("PROXY_URL")
 MES_LINK = "https://school.mos.ru/diary/"
-
-# Таймаут для запросов к МЭШ (в секундах)
 MES_TIMEOUT = 120
 
-# ===== DEEPSEEK =====
 ai_client = AsyncOpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com",
@@ -42,6 +38,9 @@ ai_client = AsyncOpenAI(
 dp = Dispatcher()
 user_sessions = {}
 
+# Хранилище "будущих" кодов подтверждения
+pending_code_futures = {}
+
 SYSTEM_PROMPT = (
     "Ты — преподаватель колледжа. Реши задание и выдай КРАТКИЕ ответы списком. "
     "Формат: 'Вопрос 1: <ответ>' — без лишних объяснений, чтобы студент мог быстро ввести. "
@@ -50,12 +49,10 @@ SYSTEM_PROMPT = (
 )
 
 class LoginState(StatesGroup):
-    waiting_for_qr_confirm = State()
+    waiting_for_code = State()
 
-# Глобальная переменная бота
 bot: Bot = None
 
-# ===== СОЗДАНИЕ БОТА (внутри async) =====
 async def create_bot() -> Bot:
     if PROXY_URL:
         session = AiohttpSession(proxy=PROXY_URL)
@@ -90,10 +87,9 @@ async def cmd_start(message: types.Message):
 @dp.message(Command("login"))
 async def cmd_login(message: types.Message, state: FSMContext):
     await message.answer("🔐 Генерирую QR-код для входа в МЭШ... Это может занять до 2 минут.")
+
     try:
         diary = MOSDiaryClient()
-        
-        # Оборачиваем вызов в asyncio.wait_for с увеличенным таймаутом
         qr_png, expires = await asyncio.wait_for(
             diary.start_qr_login(return_type="qr"),
             timeout=MES_TIMEOUT
@@ -106,38 +102,33 @@ async def cmd_login(message: types.Message, state: FSMContext):
                 "1. Открой приложение «Дневник МЭШ» на телефоне.\n"
                 "2. Перейди в «Настройки» → «Вход в Веб по QR».\n"
                 "3. Отсканируй этот QR-код и подтверди вход.\n\n"
-                "⏳ Я жду подтверждения..."
+                "⏳ Жду подтверждения... Если потребуется код из СМС — пришлю запрос."
             )
         )
 
-        await state.set_state(LoginState.waiting_for_qr_confirm)
-        await state.update_data(diary=diary, expires=expires)
+        # Функция, которая вызовется, если Mos ID запросит код
+        async def get_code() -> str:
+            future = asyncio.get_event_loop().create_future()
+            pending_code_futures[message.from_user.id] = future
 
-    except asyncio.TimeoutError:
-        await message.answer("❌ МЭШ не ответил за 2 минуты. Попробуй /login ещё раз.")
-        await state.clear()
-    except APIException as e:
-        await message.answer(f"❌ Ошибка МЭШ: {e}\nПопробуй /login заново.")
-        await state.clear()
-    except Exception as e:
-        await message.answer(f"❌ Ошибка при генерации QR: {e}")
-        await state.clear()
+            await message.answer(
+                "🔑 <b>Mos ID требует код подтверждения.</b>\n\n"
+                "Введи код из СМС (или последние 4 цифры входящего звонка)."
+            )
+            await state.set_state(LoginState.waiting_for_code)
 
-@dp.message(LoginState.waiting_for_qr_confirm)
-async def process_qr_confirm(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    diary = data.get("diary")
-    expires = data.get("expires")
+            # Ждём, пока пользователь пришлёт код
+            code = await future
+            return code
 
-    if not diary:
-        await message.answer("⚠️ Сессия истекла. Начни заново: /login")
-        await state.clear()
-        return
-
-    try:
-        # Ждём подтверждения входа (тоже с увеличенным таймаутом)
+        # Ждём подтверждения прямо здесь — не нужно отдельного обработчика
         aupd_token, refresh_token = await asyncio.wait_for(
-            diary.wait_qr_login(expires),
+            diary.wait_qr_login(
+                expires,
+                get_code=get_code,
+                verification_method="sms",
+                trust_browser=False,
+            ),
             timeout=MES_TIMEOUT
         )
 
@@ -165,17 +156,36 @@ async def process_qr_confirm(message: types.Message, state: FSMContext):
         await message.answer("❌ МЭШ не ответил за 2 минуты. Попробуй /login заново.")
         await state.clear()
     except APIException as e:
-        await message.answer(f"❌ Вход не удался: {e}\nПопробуй /login заново.")
+        await message.answer(f"❌ Ошибка МЭШ: {e}\nПопробуй /login заново.")
         await state.clear()
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}\nПопробуй /login заново.")
+        await message.answer(f"❌ Ошибка при входе: {e}")
         await state.clear()
+
+# Обработчик ввода кода подтверждения
+@dp.message(LoginState.waiting_for_code)
+async def process_code(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    code = (message.text or "").strip()
+
+    if not code:
+        await message.answer("⚠️ Введи код текстом.")
+        return
+
+    future = pending_code_futures.get(user_id)
+    if future and not future.done():
+        future.set_result(code)
+        del pending_code_futures[user_id]
+        await message.answer("⏳ Проверяю код...")
+    else:
+        await message.answer("⚠️ Не жду никакого кода. Используй /login.")
+
+    await state.clear()
 
 @dp.message(Command("logout"))
 async def cmd_logout(message: types.Message):
-    user_id = message.from_user.id
-    if user_id in user_sessions:
-        del user_sessions[user_id]
+    if message.from_user.id in user_sessions:
+        del user_sessions[message.from_user.id]
         await message.answer("✅ Ты вышел из МЭШ.")
     else:
         await message.answer("Ты и так не в системе.")
@@ -196,8 +206,6 @@ async def cmd_homework(message: types.Message):
         next_week = today + timedelta(days=7)
 
         diary = MOSDiaryClient(aupd_token=session["token"])
-        
-        # Оборачиваем в wait_for
         homeworks = await asyncio.wait_for(
             diary.get_homework(today, next_week),
             timeout=MES_TIMEOUT
@@ -219,7 +227,6 @@ async def cmd_homework(message: types.Message):
                     f"Предмет: {hw.subject_name}\nЗадание: {hw.homework}"
                 )
 
-        # Отправляем список домашек (обрезаем до 4000 символов)
         await message.answer(text[:4000])
 
         if tasks_for_ai:
