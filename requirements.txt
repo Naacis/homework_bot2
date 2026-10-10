@@ -1,0 +1,7 @@
+aiogram
+openai
+python-dotenv
+mosdiary
+beautifulsoup4
+requests
+aiohttp-socks
