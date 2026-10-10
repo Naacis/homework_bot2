@@ -17,6 +17,7 @@ from aiogram.types import BufferedInputFile
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from mosdiary import MOSDiaryClient
+from mosdiary.exceptions import APIException
 
 load_dotenv()
 
@@ -27,6 +28,9 @@ os.environ["CURL_CA_BUNDLE"] = ""
 
 PROXY_URL = os.getenv("PROXY_URL")
 MES_LINK = "https://school.mos.ru/diary/"
+
+# Таймаут для запросов к МЭШ (в секундах)
+MES_TIMEOUT = 120
 
 # ===== DEEPSEEK =====
 ai_client = AsyncOpenAI(
@@ -47,7 +51,6 @@ SYSTEM_PROMPT = (
 
 class LoginState(StatesGroup):
     waiting_for_qr_confirm = State()
-    waiting_for_code = State()
 
 # Глобальная переменная бота
 bot: Bot = None
@@ -86,10 +89,15 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("login"))
 async def cmd_login(message: types.Message, state: FSMContext):
-    await message.answer("🔐 Генерирую QR-код для входа в МЭШ...")
+    await message.answer("🔐 Генерирую QR-код для входа в МЭШ... Это может занять до 2 минут.")
     try:
         diary = MOSDiaryClient()
-        qr_png, expires = await diary.start_qr_login(return_type="qr")
+        
+        # Оборачиваем вызов в asyncio.wait_for с увеличенным таймаутом
+        qr_png, expires = await asyncio.wait_for(
+            diary.start_qr_login(return_type="qr"),
+            timeout=MES_TIMEOUT
+        )
 
         await message.answer_photo(
             BufferedInputFile(qr_png, filename="mos_qr.png"),
@@ -105,6 +113,12 @@ async def cmd_login(message: types.Message, state: FSMContext):
         await state.set_state(LoginState.waiting_for_qr_confirm)
         await state.update_data(diary=diary, expires=expires)
 
+    except asyncio.TimeoutError:
+        await message.answer("❌ МЭШ не ответил за 2 минуты. Попробуй /login ещё раз.")
+        await state.clear()
+    except APIException as e:
+        await message.answer(f"❌ Ошибка МЭШ: {e}\nПопробуй /login заново.")
+        await state.clear()
     except Exception as e:
         await message.answer(f"❌ Ошибка при генерации QR: {e}")
         await state.clear()
@@ -121,10 +135,16 @@ async def process_qr_confirm(message: types.Message, state: FSMContext):
         return
 
     try:
-        # Ждём подтверждения входа (без 2FA)
-        aupd_token, refresh_token = await diary.wait_qr_login(expires)
+        # Ждём подтверждения входа (тоже с увеличенным таймаутом)
+        aupd_token, refresh_token = await asyncio.wait_for(
+            diary.wait_qr_login(expires),
+            timeout=MES_TIMEOUT
+        )
 
-        profile = await diary.get_base_info()
+        profile = await asyncio.wait_for(
+            diary.get_base_info(),
+            timeout=MES_TIMEOUT
+        )
 
         user_sessions[message.from_user.id] = {
             "token": aupd_token,
@@ -141,11 +161,14 @@ async def process_qr_confirm(message: types.Message, state: FSMContext):
             "⚠️ Я только выписываю ответы в чат. Вводи их в МЭШ сам."
         )
 
+    except asyncio.TimeoutError:
+        await message.answer("❌ МЭШ не ответил за 2 минуты. Попробуй /login заново.")
+        await state.clear()
+    except APIException as e:
+        await message.answer(f"❌ Вход не удался: {e}\nПопробуй /login заново.")
+        await state.clear()
     except Exception as e:
-        await message.answer(
-            f"❌ Вход не удался: {e}\n\n"
-            "Попробуй /login заново."
-        )
+        await message.answer(f"❌ Ошибка: {e}\nПопробуй /login заново.")
         await state.clear()
 
 @dp.message(Command("logout"))
@@ -166,14 +189,19 @@ async def cmd_homework(message: types.Message):
         await message.answer("⚠️ Сначала войди в МЭШ командой /login.")
         return
 
-    await message.answer("📚 Загружаю домашние задания...")
+    await message.answer("📚 Загружаю домашние задания... Это может занять до 2 минут.")
 
     try:
         today = date.today()
         next_week = today + timedelta(days=7)
 
         diary = MOSDiaryClient(aupd_token=session["token"])
-        homeworks = await diary.get_homework(today, next_week)
+        
+        # Оборачиваем в wait_for
+        homeworks = await asyncio.wait_for(
+            diary.get_homework(today, next_week),
+            timeout=MES_TIMEOUT
+        )
         await diary.close()
 
         if not homeworks:
@@ -211,6 +239,10 @@ async def cmd_homework(message: types.Message):
                 f"✍️ <b>Ответы (введи их в МЭШ сам):</b>\n\n{solution}"[:4000]
             )
 
+    except asyncio.TimeoutError:
+        await message.answer("❌ МЭШ не ответил за 2 минуты. Попробуй /homework позже.")
+    except APIException as e:
+        await message.answer(f"❌ Ошибка МЭШ: {e}\nПопробуй /login заново.")
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}\nПопробуй /login заново.")
 
@@ -314,41 +346,6 @@ async def handle_photo(message: types.Message):
         )
     except Exception as e:
         await message.answer(f"❌ Ошибка с фото: {e}")
-
-# ===== ДОКУМЕНТЫ (PDF, DOCX) =====
-
-@dp.message(F.document)
-async def handle_document(message: types.Message):
-    await message.answer("📄 Читаю файл...")
-    try:
-        doc = message.document
-        file = await bot.get_file(doc.file_id)
-        file_bytes = await bot.download_file(file.file_path)
-
-        # Пробуем прочитать как текст
-        try:
-            content = file_bytes.read().decode("utf-8", errors="ignore")
-        except Exception:
-            await message.answer("⚠️ Не смог прочитать файл. Пришли скриншот.")
-            return
-
-        if len(content) < 10:
-            await message.answer("⚠️ Файл пустой или не текстовый. Пришли скриншот.")
-            return
-
-        prompt = f"Реши задание из файла:\n\n{content[:3000]}"
-        response = await ai_client.chat.completions.create(
-            model="deepseek-flash",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        await message.answer(
-            f"✍️ <b>Ответы:</b>\n\n{response.choices[0].message.content}"[:4000]
-        )
-    except Exception as e:
-        await message.answer(f"❌ Ошибка с файлом: {e}")
 
 # ===== ЗАПУСК =====
 
