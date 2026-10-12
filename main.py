@@ -26,8 +26,7 @@ PROXY_URL = os.getenv("PROXY_URL")
 MES_LINK = "https://mos.ru"
 MES_TIMEOUT = 120  # секунд ожидания ответа от МЭШ
 
-# ===== SSL (для прокси) =====
-# Если при запросах возникнут проблемы с SSL, закомментируйте или удалите эти 3 строки:
+# ===== SSL =====
 os.environ["SSL_CERT_FILE"] = ""
 os.environ["REQUESTS_CA_BUNDLE"] = ""
 os.environ["CURL_CA_BUNDLE"] = ""
@@ -92,71 +91,72 @@ async def cmd_login(message: types.Message, state: FSMContext):
     await message.answer("🔐 Генерирую QR-код... Это может занять до 2 минут.")
 
     try:
-        # Убрали ошибочный аргумент proxy, aiohttp подхватит его из системы автоматически
-        diary = MOSDiaryClient()
-        qr_png, expires = await asyncio.wait_for(
-            diary.start_qr_login(return_type="qr"),
-            timeout=MES_TIMEOUT
-        )
-
-        await message.answer_photo(
-            BufferedInputFile(qr_png, filename="mos_qr.png"),
-            caption=(
-                "📱 <b>Как войти:</b>\n\n"
-                "1. Открой приложение «Дневник МЭШ»\n"
-                "2. Настройки → «Вход в Веб по QR»\n"
-                "3. Отсканируй QR и подтверди вход\n\n"
-                "⏳ Жду подтверждения..."
+        # Используем async with, чтобы гарантировать закрытие сессии при любых ошибках
+        async with MOSDiaryClient() as diary:
+            qr_png, expires = await asyncio.wait_for(
+                diary.start_qr_login(return_type="qr"),
+                timeout=MES_TIMEOUT
             )
-        )
 
-        # Функция для запроса кода подтверждения (2FA)
-        async def get_code() -> str:
-            future = asyncio.get_event_loop().create_future()
-            pending_code_futures[message.from_user.id] = future
+            await message.answer_photo(
+                BufferedInputFile(qr_png, filename="mos_qr.png"),
+                caption=(
+                    "📱 <b>Как войти:</b>\n\n"
+                    "1. Открой приложение «Дневник МЭШ»\n"
+                    "2. Настройки → «Вход в Веб по QR»\n"
+                    "3. Отсканируй QR и подтверди вход\n\n"
+                    "⏳ Жду подтверждения..."
+                )
+            )
 
+            # Функция для запроса кода подтверждения (2FA)
+            async def get_code() -> str:
+                future = asyncio.get_event_loop().create_future()
+                pending_code_futures[message.from_user.id] = future
+
+                await message.answer(
+                    "🔑 <b>Mos ID требует код.</b>\n\n"
+                    "Введи код из СМС (или последние 4 цифры звонка)."
+                )
+                await state.set_state(LoginState.waiting_for_code)
+
+                code = await future
+                return code
+
+            aupd_token, refresh_token = await asyncio.wait_for(
+                diary.wait_qr_login(
+                    expires,
+                    get_code=get_code,
+                    verification_method="sms",
+                    trust_browser=False,
+                ),
+                timeout=MES_TIMEOUT
+            )
+
+            profile = await asyncio.wait_for(
+                diary.get_base_info(),
+                timeout=MES_TIMEOUT
+            )
+
+            user_sessions[message.from_user.id] = {
+                "token": aupd_token,
+                "refresh": refresh_token,
+                "name": profile.full_name
+            }
+
+            await state.clear()
             await message.answer(
-                "🔑 <b>Mos ID требует код.</b>\n\n"
-                "Введи код из СМС (или последние 4 цифры звонка)."
+                f"✅ Вход выполнен, <b>{profile.full_name}</b>!\n\n"
+                "Напиши /homework — покажу домашки и решения."
             )
-            await state.set_state(LoginState.waiting_for_code)
-
-            code = await future
-            return code
-
-        aupd_token, refresh_token = await asyncio.wait_for(
-            diary.wait_qr_login(
-                expires,
-                get_code=get_code,
-                verification_method="sms",
-                trust_browser=False,
-            ),
-            timeout=MES_TIMEOUT
-        )
-
-        profile = await asyncio.wait_for(
-            diary.get_base_info(),
-            timeout=MES_TIMEOUT
-        )
-
-        user_sessions[message.from_user.id] = {
-            "token": aupd_token,
-            "refresh": refresh_token,
-            "name": profile.full_name
-        }
-
-        await diary.close()
-        await state.clear()
-
-        await message.answer(
-            f"✅ Вход выполнен, <b>{profile.full_name}</b>!\n\n"
-            "Напиши /homework — покажу домашки и решения."
-        )
 
     except asyncio.TimeoutError:
         await message.answer("❌ МЭШ не ответил за 2 минуты. Попробуй /login заново.")
         await state.clear()
     except APIException as e:
+        import traceback
+        print("ПОДРОБНЫЙ ЛОГ ОШИБКИ МЭШ ПРИ ВХОДЕ:")
+        traceback.print_exc()
         await message.answer(f"❌ Ошибка МЭШ: {e}")
         await state.clear()
     except Exception as e:
@@ -205,13 +205,12 @@ async def cmd_homework(message: types.Message):
         today = date.today()
         next_week = today + timedelta(days=7)
 
-        # Здесь также убрали ошибочный аргумент proxy
-        diary = MOSDiaryClient(aupd_token=session["token"])
-        homeworks = await asyncio.wait_for(
-            diary.get_homework(today, next_week),
-            timeout=MES_TIMEOUT
-        )
-        await diary.close()
+        # Контекстный менеджер автоматически закроет сессию при завершении блока try
+        async with MOSDiaryClient(aupd_token=session["token"]) as diary:
+            homeworks = await asyncio.wait_for(
+                diary.get_homework(today, next_week),
+                timeout=MES_TIMEOUT
+            )
 
         if not homeworks:
             await message.answer("🎉 Домашек нет!")
@@ -247,6 +246,9 @@ async def cmd_homework(message: types.Message):
     except asyncio.TimeoutError:
         await message.answer("❌ МЭШ не ответил. Попробуй позже.")
     except APIException as e:
+        import traceback
+        print("ПОДРОБНЫЙ ЛОГ ОШИБКИ МЭШ ПРИ ЗАГРУЗКЕ ДЗ:")
+        traceback.print_exc()
         await message.answer(f"❌ Ошибка МЭШ: {e}\nПопробуй /login.")
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
@@ -264,7 +266,7 @@ async def handle_text(message: types.Message):
                 {"role": "user", "content": message.text}
             ]
         )
-        solution = response.choices[0].message.content
+        solution = response.choices.message.content
         await message.answer(f"✍️ <b>Ответ:</b>\n\n{solution}")
     except Exception as e:
         await message.answer(f"❌ Ошибка нейросети: {e}")
