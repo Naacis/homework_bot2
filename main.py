@@ -92,8 +92,8 @@ async def cmd_login(message: types.Message, state: FSMContext):
     await message.answer("🔐 Генерирую QR-код... Это может занять до 2 минут.")
 
     try:
-        # Передаем PROXY_URL в клиент МЭШ для обхода геоблока Railway
-        diary = MOSDiaryClient(proxy=PROXY_URL)
+        # Убрали ошибочный аргумент proxy, aiohttp подхватит его из системы автоматически
+        diary = MOSDiaryClient()
         qr_png, expires = await asyncio.wait_for(
             diary.start_qr_login(return_type="qr"),
             timeout=MES_TIMEOUT
@@ -205,8 +205,8 @@ async def cmd_homework(message: types.Message):
         today = date.today()
         next_week = today + timedelta(days=7)
 
-        # Здесь также обязательно передаем PROXY_URL
-        diary = MOSDiaryClient(aupd_token=session["token"], proxy=PROXY_URL)
+        # Здесь также убрали ошибочный аргумент proxy
+        diary = MOSDiaryClient(aupd_token=session["token"])
         homeworks = await asyncio.wait_for(
             diary.get_homework(today, next_week),
             timeout=MES_TIMEOUT
