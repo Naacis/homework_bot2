@@ -1,61 +1,36 @@
 import asyncio
 import os
 import base64
-import re
-from datetime import date, timedelta
-
-import requests
-from bs4 import BeautifulSoup
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import BufferedInputFile
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
-from mosdiary import MOSDiaryClient
-from mosdiary.exceptions import APIException
 
 load_dotenv()
 
 # ===== НАСТРОЙКИ =====
 PROXY_URL = os.getenv("PROXY_URL")
-MES_LINK = "https://mos.ru"
-MES_TIMEOUT = 120  # секунд ожидания ответа от МЭШ
-
-# ===== SSL =====
-os.environ["SSL_CERT_FILE"] = ""
-os.environ["REQUESTS_CA_BUNDLE"] = ""
-os.environ["CURL_CA_BUNDLE"] = ""
 
 # ===== DEEPSEEK =====
 ai_client = AsyncOpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://deepseek.com",
+    base_url="https://api.deepseek.com",
     timeout=60.0
 )
 
 # ===== БОТ =====
 dp = Dispatcher()
-user_sessions = {}
-pending_code_futures = {}
 
 SYSTEM_PROMPT = (
-    "Ты — преподаватель колледжа. Реши задание и выдай КРАТКИЕ ответы списком. "
-    "Формат: 'Вопрос 1: <ответ>' — без лишних объяснений. "
-    "Если это тест с вариантами — укажи букву или номер. "
-    "В конце добавь короткое пояснение."
+    "Ты — преподаватель колледжа. Реши задание и дай подробное объяснение на русском. "
+    "Распиши шаги решения, чтобы студент понял. В конце — краткий ответ."
 )
-
-class LoginState(StatesGroup):
-    waiting_for_code = State()
 
 bot: Bot = None
 
-# ===== СОЗДАНИЕ БОТА =====
 async def create_bot() -> Bot:
     if PROXY_URL:
         session = AiohttpSession(proxy=PROXY_URL)
@@ -77,186 +52,30 @@ async def create_bot() -> Bot:
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "👋 Привет! Я помогу с домашкой и тестами.\n\n"
-        "🔐 /login — войти в МЭШ по QR-коду\n"
-        "📚 /homework — показать домашки и решения\n"
-        "📸 Отправь скриншот теста — выдам ответы\n"
-        "🔗 Отправь ссылку на Google-форму — решу\n"
-        "📝 Напиши текст задания — объясню\n\n"
-        "⚠️ Я не заполняю тесты за тебя — выписываю ответы в чат."
+        "👋 Привет! Я решаю задания через DeepSeek.\n\n"
+        "📝 Отправь текст задания — решу и объясню.\n"
+        "📸 Отправь скриншот — прочитаю и решу.\n"
+        "📄 Отправь PDF или DOCX — разберу и решу.\n\n"
+        "⚠️ Я не захожу в твои аккаунты. Просто помогаю с заданиями."
     )
 
-@dp.message(Command("login"))
-async def cmd_login(message: types.Message, state: FSMContext):
-    await message.answer("🔐 Генерирую QR-код... Это может занять до 2 минут.")
-
-    try:
-        # Используем async with, чтобы гарантировать закрытие сессии при любых ошибках
-        async with MOSDiaryClient() as diary:
-            qr_png, expires = await asyncio.wait_for(
-                diary.start_qr_login(return_type="qr"),
-                timeout=MES_TIMEOUT
-            )
-
-            await message.answer_photo(
-                BufferedInputFile(qr_png, filename="mos_qr.png"),
-                caption=(
-                    "📱 <b>Как войти:</b>\n\n"
-                    "1. Открой приложение «Дневник МЭШ»\n"
-                    "2. Настройки → «Вход в Веб по QR»\n"
-                    "3. Отсканируй QR и подтверди вход\n\n"
-                    "⏳ Жду подтверждения..."
-                )
-            )
-
-            # Функция для запроса кода подтверждения (2FA)
-            async def get_code() -> str:
-                future = asyncio.get_event_loop().create_future()
-                pending_code_futures[message.from_user.id] = future
-
-                await message.answer(
-                    "🔑 <b>Mos ID требует код.</b>\n\n"
-                    "Введи код из СМС (или последние 4 цифры звонка)."
-                )
-                await state.set_state(LoginState.waiting_for_code)
-
-                code = await future
-                return code
-
-            aupd_token, refresh_token = await asyncio.wait_for(
-                diary.wait_qr_login(
-                    expires,
-                    get_code=get_code,
-                    verification_method="sms",
-                    trust_browser=False,
-                ),
-                timeout=MES_TIMEOUT
-            )
-
-            profile = await asyncio.wait_for(
-                diary.get_base_info(),
-                timeout=MES_TIMEOUT
-            )
-
-            user_sessions[message.from_user.id] = {
-                "token": aupd_token,
-                "refresh": refresh_token,
-                "name": profile.full_name
-            }
-
-            await state.clear()
-            await message.answer(
-                f"✅ Вход выполнен, <b>{profile.full_name}</b>!\n\n"
-                "Напиши /homework — покажу домашки и решения."
-            )
-
-    except asyncio.TimeoutError:
-        await message.answer("❌ МЭШ не ответил за 2 минуты. Попробуй /login заново.")
-        await state.clear()
-    except APIException as e:
-        import traceback
-        print("ПОДРОБНЫЙ ЛОГ ОШИБКИ МЭШ ПРИ ВХОДЕ:")
-        traceback.print_exc()
-        await message.answer(f"❌ Ошибка МЭШ: {e}")
-        await state.clear()
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
-        await state.clear()
-
-@dp.message(LoginState.waiting_for_code)
-async def process_code(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    code = (message.text or "").strip()
-
-    if not code:
-        await message.answer("⚠️ Введи код текстом.")
-        return
-
-    future = pending_code_futures.get(user_id)
-    if future and not future.done():
-        future.set_result(code)
-        del pending_code_futures[user_id]
-        await message.answer("⏳ Проверяю код...")
-    else:
-        await message.answer("⚠️ Не жду код. Используй /login.")
-
-    await state.clear()
-
-@dp.message(Command("logout"))
-async def cmd_logout(message: types.Message):
-    if message.from_user.id in user_sessions:
-        del user_sessions[message.from_user.id]
-        await message.answer("✅ Ты вышел из МЭШ.")
-    else:
-        await message.answer("Ты и так не в системе.")
-
-@dp.message(Command("homework"))
-async def cmd_homework(message: types.Message):
-    user_id = message.from_user.id
-    session = user_sessions.get(user_id)
-
-    if not session:
-        await message.answer("⚠️ Сначала /login.")
-        return
-
-    await message.answer("📚 Загружаю домашки... Это займёт до 2 минут.")
-
-    try:
-        today = date.today()
-        next_week = today + timedelta(days=7)
-
-        # Контекстный менеджер автоматически закроет сессию при завершении блока try
-        async with MOSDiaryClient(aupd_token=session["token"]) as diary:
-            homeworks = await asyncio.wait_for(
-                diary.get_homework(today, next_week),
-                timeout=MES_TIMEOUT
-            )
-
-        if not homeworks:
-            await message.answer("🎉 Домашек нет!")
-            return
-
-        text = f"📚 <b>Домашки для {session['name']}:</b>\n\n"
-        tasks_for_ai = []
-
-        for hw in homeworks:
-            date_str = hw.date.strftime("%d.%m")
-            text += f"📅 <b>{date_str}</b> | {hw.subject_name}:\n<i>{hw.homework}</i>\n\n"
-            if hw.homework and hw.homework.strip():
-                tasks_for_ai.append(f"Предмет: {hw.subject_name}\nЗадание: {hw.homework}")
-
-        await message.answer(text[:4000])
-
-        if tasks_for_ai:
-            await message.answer("🧠 Решаю через DeepSeek...")
-            prompt = "\n\n---\n\n".join(tasks_for_ai)
-
-            response = await ai_client.chat.completions.create(
-                model="deepseek-flash",
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            solution = response.choices[0].message.content
-            await message.answer(
-                f"✍️ <b>Ответы (введи их в МЭШ сам):</b>\n\n{solution}"[:4000]
-            )
-
-    except asyncio.TimeoutError:
-        await message.answer("❌ МЭШ не ответил. Попробуй позже.")
-    except APIException as e:
-        import traceback
-        print("ПОДРОБНЫЙ ЛОГ ОШИБКИ МЭШ ПРИ ЗАГРУЗКЕ ДЗ:")
-        traceback.print_exc()
-        await message.answer(f"❌ Ошибка МЭШ: {e}\nПопробуй /login.")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer(
+        "📌 <b>Как пользоваться:</b>\n\n"
+        "• Просто напиши задание текстом\n"
+        "• Или пришли фото задания\n"
+        "• Или пришли PDF/DOCX файл\n\n"
+        "Я решу и объясню на русском."
+    )
 
 # ===== ТЕКСТ =====
 
-@dp.message(F.text & ~F.text.startswith("http") & ~F.text.startswith("/"))
+@dp.message(F.text & ~F.text.startswith("/"))
 async def handle_text(message: types.Message):
+    if not message.text or len(message.text.strip()) < 2:
+        return
+
     await message.answer("🧠 Решаю...")
     try:
         response = await ai_client.chat.completions.create(
@@ -266,17 +85,90 @@ async def handle_text(message: types.Message):
                 {"role": "user", "content": message.text}
             ]
         )
-        solution = response.choices.message.content
-        await message.answer(f"✍️ <b>Ответ:</b>\n\n{solution}")
+        answer = response.choices[0].message.content
+        # Разбиваем длинный ответ на части по 4000 символов
+        for i in range(0, len(answer), 4000):
+            await message.answer(answer[i:i + 4000])
     except Exception as e:
-        await message.answer(f"❌ Ошибка нейросети: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
 
-# ===== ЗАПУСК БОТА =====
+# ===== ФОТО =====
+
+@dp.message(F.photo)
+async def handle_photo(message: types.Message):
+    await message.answer("📸 Читаю задание с фото...")
+    try:
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        file_bytes = await bot.download_file(file.file_path)
+        image_base64 = base64.b64encode(file_bytes.read()).decode("utf-8")
+
+        response = await ai_client.chat.completions.create(
+            model="deepseek-flash",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Прочитай задание на фото и реши его. Распиши шаги."},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}
+                        }
+                    ]
+                }
+            ]
+        )
+        answer = response.choices[0].message.content
+        for i in range(0, len(answer), 4000):
+            await message.answer(answer[i:i + 4000])
+    except Exception as e:
+        await message.answer(f"❌ Ошибка с фото: {e}")
+
+# ===== ДОКУМЕНТЫ =====
+
+@dp.message(F.document)
+async def handle_document(message: types.Message):
+    await message.answer("📄 Читаю файл...")
+    try:
+        doc = message.document
+        file = await bot.get_file(doc.file_id)
+        file_bytes = await bot.download_file(file.file_path)
+        content = file_bytes.read()
+
+        # Пробуем декодировать как текст
+        try:
+            text = content.decode("utf-8", errors="ignore")
+        except Exception:
+            await message.answer("⚠️ Не смог прочитать файл. Пришли скриншот.")
+            return
+
+        if len(text.strip()) < 10:
+            await message.answer("⚠️ Файл пустой или содержит только картинки. Пришли скриншот.")
+            return
+
+        # Обрезаем до 3000 символов
+        prompt = f"Реши задание из файла:\n\n{text[:3000]}"
+        response = await ai_client.chat.completions.create(
+            model="deepseek-flash",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        answer = response.choices[0].message.content
+        for i in range(0, len(answer), 4000):
+            await message.answer(answer[i:i + 4000])
+    except Exception as e:
+        await message.answer(f"❌ Ошибка с файлом: {e}")
+
+# ===== ЗАПУСК =====
+
 async def main():
     global bot
     bot = await create_bot()
-    print("Бот успешно запущен!")
+    print("✅ Бот запущен!")
     await dp.start_polling(bot)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())
